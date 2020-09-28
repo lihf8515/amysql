@@ -138,6 +138,7 @@ type
     parameters: seq[ColumnDefinition]
     columns: seq[ColumnDefinition]
     warnings: Natural
+    conn: Connection
 
 # Parameter and result packers/unpackers
 
@@ -295,7 +296,7 @@ proc `$`*(v: ResultValue): string =
   of rvtDate:
     return v.datetimeVal.format("yyyy-MM-dd")
   of rvtTimestamp:
-    $v.datetimeVal.toTime.toUnix
+    return $v.datetimeVal.toTime.toUnix
   of rvtTime:
     let dp = toParts(v.durVal)
     let hours = dp[Days] * 24 + dp[Hours]
@@ -340,6 +341,8 @@ converter asString*(v: ResultValue): string =
     return ""
   of rvtString, rvtBlob:
     return v.strVal
+  of rvtDate:
+    return v.datetimeVal.format("yyyy-MM-dd")
   else:
     raise newException(ValueError, "Can't convert " & $(v.typ) & " to string")
 
@@ -743,7 +746,6 @@ proc rawQuery*(conn: Connection, query: string, onlyFirst:static[bool] = false):
     raise parseErrorPacket(pkt)
   else:
     conn.fetchResultset(pkt, result, onlyFirst, true, result.rows.add(parseTextRow(pkt)))
-  return
 
 proc performPreparedQuery(conn: Connection, pstmt: SqlPrepared, st: Future[void], onlyFirst:static[bool] = false): Future[ResultSet[ResultValue]] {.
                           async#[, tags:[RootEffect]]#.} =
