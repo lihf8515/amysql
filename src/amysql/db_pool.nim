@@ -242,7 +242,7 @@ proc rawQuery*(self: DBPool, query: string, onlyFirst:static[bool] = false): Fut
   debugEcho "reader send"
   let msg = conn.writer[].recv()
   debugEcho fmt"recv:{$msg}"
-  self.freeConn.add conn
+  self.freeConn.incl conn
   return msg.textVal
 
 proc query(self: DBPool, pstmt: DBSqlPrepared, params: seq[SqlParam]): Future[ResultSet[ResultValue]] {.async.} =
