@@ -33,7 +33,7 @@ type
     text,
     binary
   InterfaceKind {.pure.} = enum
-    none,query,prepare,finalize,reset
+    none,query,prepare,finalize,reset,exec
   DBStmt {.pure.} = object
     case kind:StmtKind
     of text:
@@ -46,7 +46,7 @@ type
       params:seq[SqlParam]
     of InterfaceKind.none:
       discard
-    of InterfaceKind.prepare:
+    of InterfaceKind.prepare,InterfaceKind.exec:
       q:string
     of InterfaceKind.finalize,InterfaceKind.reset:
       pstmt:SqlPrepared
@@ -109,10 +109,19 @@ proc worker(ctx:Conext) =
       debugEcho fmt"dataAvailable:{$st}"
       case st.kind
       of StmtKind.text: 
-        let r = waitFor ctx.conn.conn.rawQuery(st.textVal )
-        debugEcho fmt"result:{$r}"
-        let p = DBResult(kind:DBResultKind.resultsetText,textVal:r)
-        ctx.conn.writer[].send(p)
+        case st.met:
+        of InterfaceKind.query:
+          let r = waitFor ctx.conn.conn.rawQuery(st.textVal )
+          debugEcho fmt"result:{$r}"
+          let p = DBResult(kind:DBResultKind.resultsetText,textVal:r)
+          ctx.conn.writer[].send(p)
+        of InterfaceKind.exec:
+          let r = waitFor ctx.conn.conn.rawExec(st.q)
+          debugEcho fmt"result:{$r}"
+          let p = DBResult(kind:DBResultKind.resultsetText,textVal:r)
+          ctx.conn.writer[].send(p)
+        else:
+          discard
       else: 
         case st.met:
         of InterfaceKind.none:
@@ -134,6 +143,9 @@ proc worker(ctx:Conext) =
           waitFor ctx.conn.conn.reset(st.pstmt)
           let p = DBResult(kind:DBResultKind.none)
           ctx.conn.writer[].send(p)
+        else:
+          discard
+        
 
 proc handleParams(query: string,minPoolSize,maxPoolSize:var int):string =
   var key, val: string
@@ -257,6 +269,14 @@ proc query(self: DBPool, pstmt: DBSqlPrepared, params: seq[SqlParam]): Future[Re
 proc query*(self: DBPool, pstmt: DBSqlPrepared, params: varargs[SqlParam, asParam]): Future[ResultSet[ResultValue]] =
   let p:seq[SqlParam] = @params
   self.query(pstmt,p)
+
+proc rawExec*(self: DBPool, query: string): Future[ResultSet[string]] {.
+               async.} =
+  let conn = await self.fetchConn()
+  conn.reader[].send(DBStmt(met:InterfaceKind.exec,kind:StmtKind.text,textVal:query))
+  let msg = conn.writer[].recv()
+  self.freeConn.incl conn
+  return msg.textVal
 
 proc prepare*(self: DBPool, query: string): Future[DBSqlPrepared] {.async.} =
   let conn = await self.fetchConn()
