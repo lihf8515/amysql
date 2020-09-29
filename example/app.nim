@@ -11,8 +11,9 @@ const pass_word = "123456"
 
 var pool {.threadvar.}: DBPool
 
+pool = waitFor newDBPool(fmt"mysqlx://{user_name}:{pass_word}@{host_name}/{database_name}?minPoolSize=2&maxPoolSize=4")
+
 proc hello*(ctx: Context) {.async.} =
-  pool = waitFor newDBPool(fmt"mysqlx://{user_name}:{pass_word}@{host_name}/{database_name}?minPoolSize=2&maxPoolSize=4")
   let a = await pool.rawQuery("drop table if exists test_dt")
   resp "<h1>Hello, Prologue!</h1>"
 
