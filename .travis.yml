@@ -123,5 +123,6 @@ install:
 
 script:
   - nimble test -d:test
+  - nim c -r example/app.nim
   
   
