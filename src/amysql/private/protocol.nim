@@ -22,14 +22,14 @@ when defined(mysql_compression_mode):
 # between the two cases, we check the length of the packet: EOFs
 # are always short, and an 0xFE in a result row would be followed
 # by at least 65538 bytes of data.
-proc isEOFPacket*(pkt: openarray[char]): bool =
-  result = (len(pkt) >= 1) and (pkt[0] == char(ResponseCode_EOF)) and (len(pkt) < 9)
+proc isEOFPacket*(conn:Connection): bool =
+  result = conn.payloadLen >= 3 and (conn.firstByte == char(ResponseCode_EOF)) and (conn.payloadLen < 9)
 
 # Error packets are simpler to detect, because 0xFF is not (yet?)
 # valid as the start of a length-encoded-integer.
-proc isERRPacket*(pkt: openarray[char]): bool = (len(pkt) >= 3) and (pkt[0] == char(ResponseCode_ERR))
+proc isERRPacket*(conn:Connection): bool = conn.payloadLen >= 3 and (conn.firstByte == char(ResponseCode_ERR))
 
-proc isOKPacket*(pkt: openarray[char]): bool = (len(pkt) >= 3) and (pkt[0] == char(ResponseCode_OK))
+proc isOKPacket*(conn:Connection): bool = conn.payloadLen >= 3 and (conn.firstByte == char(ResponseCode_OK))
 
 proc isAuthSwitchRequestPacket*(pkt: openarray[char]): bool = 
   ## http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::AuthSwitchRequest
@@ -372,8 +372,8 @@ proc sendQuery*(conn: Connection, query: string): Future[void] {.tags:[WriteIOEf
 
 ## MySQL packet packers/unpackers
 
-proc processHeader(c: Connection, header: string): nat24 =
-  result = getInt32(header,0)
+proc processHeader(c: Connection, header: openarray[char]): nat24 =
+  result = getInt32(@header,0)
   const errMsg = "Bad packet id (got sequence id $1, expected $2)"
   const errMsg2 = "Bad packet id (got compressed sequence id $1, expected $2)"
   let pnum = uint8(header[3])
@@ -391,19 +391,21 @@ proc processHeader(c: Connection, header: string): nat24 =
       raise newException(ProtocolError, errMsg.format(pnum,c.sequenceId) )
     c.sequenceId += 1
 
-proc receivePacket*(conn:Connection, drop_ok: bool = false): Future[seq[char]] {.async, tags:[ReadIOEffect,RootEffect].} =
+proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadIOEffect,RootEffect].} =
   # drop_ok used when close
   # https://dev.mysql.com/doc/internals/en/uncompressed-payload.html
   when TestWhileIdle:
     conn.lastOperationTime = now()
   const TimeoutErrorMsg = "Timeout when receive packet"
-  var header:string
+  const NormalLen = 4
+  const CompressedLen = 7
+  var offset:int
+  var headerLen:int
   when not defined(mysql_compression_mode):
-    let rec = conn.socket.recv(4)
+    let rec = conn.socket.recvInto(conn.buf.addr,NormalLen)
     let success = await withTimeout(rec, ReadTimeOut)
     if not success:
       raise newException(TimeoutError, TimeoutErrorMsg)
-    header = rec.read
   else:
     if conn.use_zstd():
       # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression_packet.html#sect_protocol_basic_compression_packet_header
@@ -411,42 +413,41 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false): Future[seq[char]] {
       # (3)compressed payload length   = 22 00 00 -> 34 (41 - 7)
       # (1)sequence id                 = 00       ->  0
       # (3)uncompressed payload length = 32 00 00 -> 50
-      let rec = conn.socket.recv(7)
+      offset = CompressedLen
+      let rec = conn.socket.recvInto(conn.buf.addr,CompressedLen)
       let success = await withTimeout(rec, ReadTimeOut)
       if not success:
         raise newException(TimeoutError, TimeoutErrorMsg)
-      header = rec.read
+      headerLen = rec.read
     else:
-      let rec = conn.socket.recv(4)
+      offset = NormalLen
+      let rec = conn.socket.recvInto(conn.buf.addr,NormalLen)
       let success = await withTimeout(rec, ReadTimeOut)
       if not success:
         raise newException(TimeoutError, TimeoutErrorMsg)
-      header = rec.read
-  if len(header) == 0:
+      headerLen = rec.read
+  if headerLen == 0:
     if drop_ok:
-      return result
+      return 
     else:
       raise newException(ProtocolError, "Connection closed")
-  if len(header) != 4 and len(header) != 7:
+  if headerLen != 4 and headerLen != 7:
     raise newException(ProtocolError, "Connection closed unexpectedly")
-  let payloadLen = conn.processHeader(header)
-  if payloadLen == 0:
-    return result
-  result.setLen(payloadLen)
-  let payload = conn.socket.recvInto(result[0].addr,payloadLen)
+  conn.payloadLen = conn.processHeader(conn.buf)
+  if conn.payloadLen == 0:
+    return 
+  let payload = conn.socket.recvInto(conn.buf[offset].addr,MysqlBufSize)
   let payloadRecvSuccess = await withTimeout(payload, ReadTimeOut)
   if not payloadRecvSuccess:
     raise newException(TimeoutError, TimeoutErrorMsg)
-  let received = payload.read
-  debug "receive header" & repr header
-  debug "receive payload" & repr result
-  if received == 0:
+  conn.bufLen = payload.read
+  if conn.bufLen == 0:
     raise newException(ProtocolError, "Connection closed unexpectedly")
-  if received != payloadLen:
-    raise newException(ProtocolError, "TODO finish this part")
+  # if bufLen != payloadLen:
+  #   raise newException(ProtocolError, "TODO finish this part")
   when defined(mysql_compression_mode):
     if conn.use_zstd():
-      let uncompressedLen = getInt32(header,4)
+      let uncompressedLen = getInt32(conn.buf,4)
       let isUncompressed = uncompressedLen == 0
       if isUncompressed:
         # 07 00 00 02  00                      00                          00                02   00            00 00
@@ -464,15 +465,15 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false): Future[seq[char]] {
       result.delete(0)
       debug repr cast[seq[byte]](result)
 
-proc roundtrip*(conn:Connection, data: string): Future[seq[char]] {.async, tags:[IOEffect,RootEffect].} =
+proc roundtrip*(conn:Connection, data: string) {.async, tags:[IOEffect,RootEffect].} =
   var buf: string = newStringOfCap(32)
   buf.setLen(4)
   buf.add data
   await conn.sendPacket(buf)
-  let pkt = await conn.receivePacket()
-  if isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
-  return pkt
+  await conn.receivePacket()
+  if isERRPacket(conn):
+    raise parseErrorPacket(conn)
+  return
 
 proc processMetadata*(meta:var seq[ColumnDefinition], index: int , pkt: openarray[char], pos:var int) =
   # https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnDefinition41
@@ -498,7 +499,7 @@ proc receiveMetadata*(conn: Connection, count: Positive): Future[seq[ColumnDefin
   var received = 0
   result = newSeq[ColumnDefinition](count)
   while received < count:
-    let pkt = await conn.receivePacket()
+    await conn.receivePacket()
     if uint8(pkt[0]) == ResponseCode_ERR or uint8(pkt[0]) == ResponseCode_EOF:
       raise newException(ProtocolError, "TODO")
     var pos = 0

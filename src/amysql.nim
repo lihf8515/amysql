@@ -412,7 +412,7 @@ proc prepare*(conn: Connection, qs: string): Future[SqlPrepared] {.async.} =
   buf.add( char(Command.statementPrepare) )
   buf.add(qs)
   await conn.sendPacket(buf, resetSeqId=true)
-  let pkt = await conn.receivePacket()
+  await conn.receivePacket()
   if isERRPacket(pkt):
     raise parseErrorPacket(pkt)
   if pkt[0] != char(ResponseCode_OK) or len(pkt) < 12:
@@ -617,19 +617,19 @@ template processResultset(conn: Connection, pkt:openarray[char], pos:var int, re
       pkt1 = pkt[pos ..< pos + pkt1Len] # pkt[0].unsafeAddr.toOpenArray(pos, pos + pkt1Len - 1)
       inc(pos,pkt1Len)
     else:
-      pkt1 = await conn.receivePacket()
+      await conn.receivePacket()
       # pkt1 = pkt[0].unsafeAddr.toOpenArray(0, pkt.len - 1)
-    if isEOFPacket(pkt1):
-        result.status = parseEOFPacket(pkt1)
+    if isEOFPacket(conn):
+        result.status = parseEOFPacket(conn)
         debug result.status.statusFlags
         if conn.use_zstd():
           discard
         else:
           break
-    elif isTextMode and isOKPacket(pkt1):
-      result.status = parseOKPacket(conn, pkt1)
+    elif isTextMode and isOKPacket(conn):
+      result.status = parseOKPacket(conn)
       break
-    elif isERRPacket(pkt1):
+    elif isERRPacket(conn):
       raise parseErrorPacket(pkt1)
     else:
       process
@@ -647,7 +647,7 @@ template fetchResultset(conn:Connection, pkt:typed, result:typed, onlyFirst:type
 proc rawExec*(conn: Connection, qs: string): Future[ResultSet[string]] {.
                async,#[ tags: [ReadDbEffect, WriteDbEffect,RootEffect]]#.} =
   await conn.sendQuery(qs)
-  let pkt = await conn.receivePacket()
+  await conn.receivePacket()
   if isOKPacket(pkt):
     # Success, but no rows returned.
     result.status = parseOKPacket(conn, pkt)
@@ -659,7 +659,7 @@ proc rawExec*(conn: Connection, qs: string): Future[ResultSet[string]] {.
 proc rawQuery*(conn: Connection, qs: string, onlyFirst:bool = false): Future[ResultSet[string]] {.
                async, #[ tags: [ReadDbEffect, WriteDbEffect,RootEffect]]#.} =
   await conn.sendQuery(qs)
-  let pkt = await conn.receivePacket()
+  await conn.receivePacket()
   debug repr pkt
   if isOKPacket(pkt):
     # Success, but no rows returned.
@@ -674,7 +674,7 @@ proc rawQuery*(conn: Connection, qs: string, onlyFirst:bool = false): Future[Res
 proc performPreparedQuery*(conn: Connection, pstmt: SqlPrepared, st: Future[void], onlyFirst:static[bool] = false): Future[ResultSet[ResultValue]] {.
                           async#[, tags:[RootEffect]]#.} =
   await st
-  let pkt = await conn.receivePacket()
+  await conn.receivePacket()
   if isOKPacket(pkt):
     # Success, but no rows returned.
     result.status = parseOKPacket(conn, pkt)
@@ -696,7 +696,7 @@ proc selectDatabase*(conn: Connection, database: string): Future[ResponseOK] {.a
   buf.add( Command.initDb.char )
   buf.add(database)
   await conn.sendPacket(buf, resetSeqId=true)
-  let pkt = await conn.receivePacket()
+  await conn.receivePacket()
   if isERRPacket(pkt):
     raise parseErrorPacket(pkt)
   elif isOKPacket(pkt):
