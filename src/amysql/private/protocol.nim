@@ -31,74 +31,77 @@ proc isERRPacket*(conn:Connection): bool = conn.payloadLen >= 3 and (conn.firstB
 
 proc isOKPacket*(conn:Connection): bool = conn.payloadLen >= 3 and (conn.firstByte == char(ResponseCode_OK))
 
-proc isAuthSwitchRequestPacket*(pkt: openarray[char]): bool = 
+proc isAuthSwitchRequestPacket*(conn: Connection): bool = 
   ## http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::AuthSwitchRequest
-  pkt[0] == char(ResponseCode_AuthSwitchRequest)
+  conn.firstByte == char(ResponseCode_AuthSwitchRequest)
 
-proc isExtraAuthDataPacket*(pkt: openarray[char]): bool = 
+proc isExtraAuthDataPacket*(conn: Connection): bool = 
   ## https://dev.mysql.com/doc/internals/en/successful-authentication.html
-  pkt[0] == char(ResponseCode_ExtraAuthData)
+  conn.firstByte == char(ResponseCode_ExtraAuthData)
 
-proc parseErrorPacket*(pkt: openarray[char]): ref ResponseERR =
+proc parseErrorPacket*(conn: Connection): ref ResponseERR =
   new(result)
-  result.error_code = scanU16(pkt, 1)
-  var pos: int
-  if len(pkt) >= 9 and pkt[3] == '#':
-    result.sqlstate = cast[string](pkt[4 .. 8])
-    pos = 9
+  result.error_code = scanU16(conn.buf,conn.bufPos + 1)
+  inc(conn.bufPos,2)
+  # var pos: int
+  if conn.payloadLen >= 9 and conn.buf[conn.bufPos + 3] == '#':
+    # result.sqlstate = cast[string](cast[ptr UncheckedArray[char]](conn.buf[0].addr).toOpenArray(4,8))
+    inc(conn.bufPos,9)
   else:
-    pos = 3
-  result.msg = cast[string](pkt[pos .. high(pkt)])
+    inc(conn.bufPos,3)
+  # result.msg = cast[string](buf[])
 
-proc parseHandshakePacket*(conn: Connection, buf: openarray[char]): HandshakePacket = 
+proc parseHandshakePacket*(conn: Connection): HandshakePacket = 
   new result
-  result.protocolVersion = int(buf[0])
+  result.protocolVersion = int(conn.firstByte)
   if result.protocolVersion != HandshakeV10.int:
     raise newException(ProtocolError, "Unexpected protocol version: " & $result.protocolVersion)
-  var pos = 1
-  conn.serverVersion = readNulString(buf, pos)
+  # var pos = 1
+  inc(conn.bufPos)
+  conn.serverVersion = readNulString(conn.buf, conn.bufPos)
   result.serverVersion = conn.serverVersion
-  conn.threadId = scanU32(buf, pos)
+  conn.threadId = scanU32(conn.buf, conn.bufPos)
   result.threadId = int(conn.threadId)
-  inc(pos,4)
-  result.scrambleBuff1 = cast[string](buf[pos .. pos+7])
-  inc(pos,8)
-  inc pos # filter0
-  let capabilities1 = scanU16(buf, pos)
+  inc(conn.bufPos,4)
+  result.scramblebuff1 = cast[string](conn.buf[conn.bufPos .. conn.bufPos+7])
+  inc(conn.bufPos,8)
+  inc conn.bufPos # filter0
+  let capabilities1 = scanU16(conn.buf, conn.bufPos)
   result.capabilities1 = int(capabilities1)
   result.capabilities = result.capabilities1
   conn.serverCaps = cast[set[Cap]](capabilities1)
-  inc(pos,2)
-  result.charset = int(buf[pos])
-  inc pos
-  result.serverStatus = int(scanU16(buf, pos))
-  inc pos,2
+  inc(conn.bufPos,2)
+  result.charset = int(conn.buf[conn.bufPos])
+  inc conn.bufPos
+  result.serverStatus = int(scanU16(conn.buf, conn.bufPos))
+  inc conn.bufPos,2
   result.protocol41 = (capabilities1 and Cap.protocol41.ord) > 0
   if not result.protocol41:
     raise newException(ProtocolError, "Old (pre-4.1) server protocol")
 
-  let capabilities2 = scanU16(buf, pos)
+  let capabilities2 = scanU16(conn.buf, conn.bufPos)
   result.capabilities2 = int(capabilities2)
-  inc pos,2
+  inc conn.bufPos,2
   let cap = uint32(capabilities1) + (uint32(capabilities2) shl 16)
   conn.serverCaps = cast[set[Cap]]( cap )
   result.capabilities = int(cap)
-  result.scrambleLen = int(buf[pos])
-  inc pos
-  inc pos,10 # filter2
-  result.scrambleBuff2 = cast[string](buf[pos ..< (pos + 12)])
-  inc pos,12
+  result.scrambleLen = int(conn.buf[conn.bufPos])
+  inc conn.bufPos
+  inc conn.bufPos,10 # filter2
+  result.scrambleBuff2 = cast[string](conn.buf[conn.bufPos ..< (conn.bufPos + 12)])
+  inc conn.bufPos,12
   result.scrambleBuff = result.scrambleBuff1 & result.scrambleBuff2
-  inc pos # filter 3
+  inc conn.bufPos # filter 3
   if Cap.pluginAuth in conn.serverCaps:
-    result.plugin = readNulStringX(buf, pos)
+    result.plugin = readNulStringX(conn.buf, conn.bufPos)
 
-proc parseAuthSwitchPacket*(conn: Connection, pkt: openarray[char]): ref ResponseAuthSwitch =
+proc parseAuthSwitchPacket*(conn: Connection): ref ResponseAuthSwitch =
   new(result)
-  var pos: int = 1
+  # var pos: int = 1
+  inc(conn.bufPos)
   result.status = ResponseCode_ExtraAuthData
-  result.pluginName = readNulString(pkt, pos)
-  result.pluginData = readNulStringX(pkt, pos)
+  result.pluginName = readNulString(conn.buf, conn.bufPos)
+  result.pluginData = readNulStringX(conn.buf, conn.bufPos)
 
 proc parseResponseAuthMorePacket*(conn: Connection,pkt: string): ref ResponseAuthMore =
   new(result)
@@ -106,25 +109,28 @@ proc parseResponseAuthMorePacket*(conn: Connection,pkt: string): ref ResponseAut
   result.status = ResponseCode_ExtraAuthData
   result.pluginData = readNulStringX(pkt, pos)
 
-proc parseOKPacket*(conn: Connection, pkt: openarray[char]): ResponseOK =
+proc parseOKPacket*(conn: Connection): ResponseOK =
   result.eof = false
-  var pos: int = 1
-  result.affectedRows = readLenInt(pkt, pos)
-  result.lastInsertId = readLenInt(pkt, pos)
+  # var pos: int = 1
+  inc(conn.bufPos)
+  result.affectedRows = readLenInt(conn.buf, conn.bufPos)
+  result.lastInsertId = readLenInt(conn.buf, conn.bufPos)
   # We always supply Cap.protocol41 in client caps
-  result.statusFlags = cast[set[Status]]( scanU16(pkt, pos) )
-  result.warningCount = scanU16(pkt, pos+2)
-  pos = pos + 4
+  result.statusFlags = cast[set[Status]]( scanU16(conn.buf, conn.bufPos) )
+  result.warningCount = scanU16(conn.buf, conn.bufPos+2)
+  inc(conn.bufPos,4)
   if Cap.sessionTrack in conn.clientCaps:
-    result.info = readLenStr(pkt, pos)
+    result.info = readLenStr(conn.buf, conn.bufPos)
   else:
-    result.info = readNulStringX(pkt, pos)
+    result.info = readNulStringX(conn.buf, conn.bufPos)
 
-proc parseEOFPacket*(pkt: openarray[char]): ResponseOK =
+proc parseEOFPacket*(conn: Connection): ResponseOK =
   result.eof = true
-  if len(pkt) > 1:
-    result.warningCount = scanU16(pkt, 1)
-    result.statusFlags = cast[set[Status]]( scanU16(pkt, 3) )
+  if conn.payloadLen > 1:
+    result.warningCount = scanU16(conn.buf, conn.bufPos)
+    inc(conn.bufPos,2)
+    result.statusFlags = cast[set[Status]]( scanU16(conn.buf, conn.bufPos) )
+    inc(conn.bufPos,2)
 
 proc sendPacket*(conn: Connection, buf: sink string, resetSeqId = false): Future[void] {.async.} =
   # Caller must have left the first four bytes of the buffer available for
@@ -394,6 +400,7 @@ proc processHeader(c: Connection, header: openarray[char]): nat24 =
 proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadIOEffect,RootEffect].} =
   # drop_ok used when close
   # https://dev.mysql.com/doc/internals/en/uncompressed-payload.html
+  conn.bufPos = 0
   when TestWhileIdle:
     conn.lastOperationTime = now()
   const TimeoutErrorMsg = "Timeout when receive packet"
@@ -402,10 +409,11 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   var offset:int
   var headerLen:int
   when not defined(mysql_compression_mode):
-    let rec = conn.socket.recvInto(conn.buf.addr,NormalLen)
+    let rec = conn.socket.recvInto(conn.buf[0].addr, NormalLen)
     let success = await withTimeout(rec, ReadTimeOut)
     if not success:
       raise newException(TimeoutError, TimeoutErrorMsg)
+    headerLen = rec.read
   else:
     if conn.use_zstd():
       # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression_packet.html#sect_protocol_basic_compression_packet_header
@@ -414,18 +422,20 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
       # (1)sequence id                 = 00       ->  0
       # (3)uncompressed payload length = 32 00 00 -> 50
       offset = CompressedLen
-      let rec = conn.socket.recvInto(conn.buf.addr,CompressedLen)
+      let rec = conn.socket.recvInto(conn.buf[0].addr,CompressedLen)
       let success = await withTimeout(rec, ReadTimeOut)
       if not success:
         raise newException(TimeoutError, TimeoutErrorMsg)
       headerLen = rec.read
     else:
       offset = NormalLen
-      let rec = conn.socket.recvInto(conn.buf.addr,NormalLen)
+      let rec = conn.socket.recvInto(conn.buf[0].addr,NormalLen)
       let success = await withTimeout(rec, ReadTimeOut)
       if not success:
         raise newException(TimeoutError, TimeoutErrorMsg)
       headerLen = rec.read
+  debug "headerLen:" & $headerLen
+  debug repr conn.buf
   if headerLen == 0:
     if drop_ok:
       return 
@@ -436,7 +446,7 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   conn.payloadLen = conn.processHeader(conn.buf)
   if conn.payloadLen == 0:
     return 
-  let payload = conn.socket.recvInto(conn.buf[offset].addr,MysqlBufSize)
+  let payload = conn.socket.recvInto(conn.buf[0].addr,MysqlBufSize)
   let payloadRecvSuccess = await withTimeout(payload, ReadTimeOut)
   if not payloadRecvSuccess:
     raise newException(TimeoutError, TimeoutErrorMsg)
@@ -475,37 +485,36 @@ proc roundtrip*(conn:Connection, data: string) {.async, tags:[IOEffect,RootEffec
     raise parseErrorPacket(conn)
   return
 
-proc processMetadata*(meta:var seq[ColumnDefinition], index: int , pkt: openarray[char], pos:var int) =
+proc processMetadata*(conn: Connection, meta:var seq[ColumnDefinition], index: int) =
   # https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnDefinition41
   # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
-  meta[index].catalog = readLenStr(pkt, pos)
-  meta[index].schema = readLenStr(pkt, pos)
-  meta[index].table = readLenStr(pkt, pos)
-  meta[index].origTable = readLenStr(pkt, pos)
-  meta[index].name = readLenStr(pkt, pos)
-  meta[index].origName = readLenStr(pkt, pos)
-  let extras_len = readLenInt(pkt, pos)
+  meta[index].catalog = readLenStr(conn.buf, conn.bufPos)
+  meta[index].schema = readLenStr(conn.buf, conn.bufPos)
+  meta[index].table = readLenStr(conn.buf, conn.bufPos)
+  meta[index].origTable = readLenStr(conn.buf, conn.bufPos)
+  meta[index].name = readLenStr(conn.buf, conn.bufPos)
+  meta[index].origName = readLenStr(conn.buf, conn.bufPos)
+  let extras_len = readLenInt(conn.buf, conn.bufPos)
   # length of the following fields (always 0x0c)
-  if extras_len < 10 or (pos+extras_len > len(pkt)):
+  if extras_len < 10 or (conn.bufPos+extras_len > len(conn.buf)):
     raise newException(ProtocolError, "truncated column packet")
-  meta[index].charset = int16(scanU16(pkt, pos))
-  meta[index].length = scanU32(pkt, pos+2)
-  meta[index].columnType = FieldType(uint8(pkt[pos+6]))
-  meta[index].flags = cast[set[FieldFlag]](scanU16(pkt, pos+7))
-  meta[index].decimals = int(pkt[pos+9])
-  inc(pos, 12) # filter
+  meta[index].charset = int16(scanU16(conn.buf, conn.bufPos))
+  meta[index].length = scanU32(conn.buf, conn.bufPos+2)
+  meta[index].columnType = FieldType(uint8(conn.buf[conn.bufPos+6]))
+  meta[index].flags = cast[set[FieldFlag]](scanU16(conn.buf, conn.bufPos+7))
+  meta[index].decimals = int(conn.buf[conn.bufPos+9])
+  inc(conn.bufPos, 12) # filter
 
 proc receiveMetadata*(conn: Connection, count: Positive): Future[seq[ColumnDefinition]] {.async.} =
   var received = 0
   result = newSeq[ColumnDefinition](count)
   while received < count:
     await conn.receivePacket()
-    if uint8(pkt[0]) == ResponseCode_ERR or uint8(pkt[0]) == ResponseCode_EOF:
+    if conn.firstByte.uint8 == ResponseCode_ERR or conn.firstByte.uint8 == ResponseCode_EOF:
       raise newException(ProtocolError, "TODO")
-    var pos = 0
-    processMetadata(result,received,pkt,pos)
+    conn.processMetadata(result,received)
     inc(received)
-  let endPacket = await conn.receivePacket()
+  await conn.receivePacket()
   # If the CLIENT_DEPRECATE_EOF client capability flag is not set, EOF_Packet
-  if uint8(endPacket[0]) != ResponseCode_EOF:
+  if conn.firstByte.uint8 != ResponseCode_EOF:
     raise newException(ProtocolError, "Expected EOF after column defs, got something else")

@@ -7,7 +7,7 @@
 ##
 ## Copyright (c) 2015 William Lewis
 ## Copyright (c) 2020 Bung
-# {.experimental: "views".}
+{.experimental: "views".}
 import amysql/private/protocol
 export protocol
 import amysql/private/format
@@ -413,27 +413,28 @@ proc prepare*(conn: Connection, qs: string): Future[SqlPrepared] {.async.} =
   buf.add(qs)
   await conn.sendPacket(buf, resetSeqId=true)
   await conn.receivePacket()
-  if isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
-  if pkt[0] != char(ResponseCode_OK) or len(pkt) < 12:
-    raise newException(ProtocolError, "Unexpected response to STMT_PREPARE (len=" & $(pkt.len) & ", first byte=0x" & toHex(int(pkt[0]), 2) & ")")
-  let numColumns = scanU16(pkt, 5)
-  let numParams = scanU16(pkt, 7)
-  let numWarnings = scanU16(pkt, 10)
-
+  if isERRPacket(conn):
+    raise parseErrorPacket(conn)
+  if conn.firstByte != char(ResponseCode_OK) or conn.payloadLen < 12:
+    const ErrorMsg = "Unexpected response to STMT_PREPARE (len=$1, first byte=0x$2)"
+    raise newException(ProtocolError,ErrorMsg.format(conn.payloadLen,toHex(int(conn.firstByte), 2)) )
+  let numColumns = scanU16(conn.buf, 5)
+  let numParams = scanU16(conn.buf, 7)
+  let numWarnings = scanU16(conn.buf, 10)
+  inc(conn.bufPos,12)
   new(result)
   result.warnings = numWarnings
-  for b in 0 .. 3: result.statement_id[b] = pkt[1+b]
-  var pos = 12
-  let pktLen = pkt.len()
+  for b in 0 .. 3: result.statement_id[b] = conn.buf[1+b]
+  # var pos = 12
+  # let pktLen = pkt.len()
   if numParams > 0'u16:
     debug "prepare receiveMetadata numParams:" & $numParams
-    if pktLen > pos:
+    if conn.payloadLen > conn.bufPos:
       var index = 0
       result.parameters = newSeq[ColumnDefinition](numParams)
       while index < numParams.int:
-        inc(pos,4)
-        processMetadata(result.parameters, index, pkt, pos)
+        inc(conn.bufPos,4)
+        conn.processMetadata(result.parameters, index)
         inc index
     else:
       result.parameters = await conn.receiveMetadata(int(numParams))
@@ -441,12 +442,12 @@ proc prepare*(conn: Connection, qs: string): Future[SqlPrepared] {.async.} =
     result.parameters = newSeq[ColumnDefinition](0)
   if numColumns > 0'u16:
     debug "prepare receiveMetadata numColumns:" & $numColumns
-    if pktLen > pos:
+    if conn.payloadLen > conn.bufPos:
       var index = 0
       result.columns = newSeq[ColumnDefinition](numColumns)
       while index < numColumns.int:
-        inc(pos,4)
-        processMetadata(result.columns, index, pkt, pos)
+        inc(conn.bufPos,4)
+        conn.processMetadata(result.columns, index)
         inc index
     else:
       result.columns = await conn.receiveMetadata(int(numColumns))
@@ -589,17 +590,17 @@ proc query*(conn: Connection, pstmt: SqlPrepared, params: openarray[static[SqlPa
   var pkt = conn.formatBoundParams(pstmt, params)
   return conn.sendPacket(pkt, resetSeqId=true)
 
-template processResultset(conn: Connection, pkt:openarray[char], pos:var int, result: typed,isFirst:static[bool],onlyFirst:typed, isTextMode:static[bool], process:untyped): untyped {.dirty.} =
+template processResultset(conn: Connection, result: typed,isFirst:static[bool],onlyFirst:typed, isTextMode:static[bool], process:untyped): untyped {.dirty.} =
   when not isFirst:
-    inc(pos,4)
-  let columnCount = readLenInt(pkt, pos)
+    inc(conn.bufPos,4)
+  let columnCount = readLenInt(conn.buf, conn.bufPos)
   debug "result.columns len" &  $result.columns.len
   if conn.use_zstd():
     var index = 0
     result.columns = newSeq[ColumnDefinition](columnCount)
     while index < columnCount.int:
-      inc(pos,4)
-      processMetadata(result.columns, index, pkt, pos)
+      inc(conn.bufPos,4)
+      conn.processMetadata(result.columns, index)
       inc index
   else:
     result.columns = await conn.receiveMetadata(columnCount)
@@ -607,15 +608,15 @@ template processResultset(conn: Connection, pkt:openarray[char], pos:var int, re
   # var pkt1: openarray[char]
   var pkt1: seq[char]
   var pkt1Len:int
-  let fullLen = pkt.len
+  let fullLen = conn.payloadLen
   while true:
     if conn.use_zstd():
-      if pos >= fullLen:
+      if conn.bufPos >= fullLen:
         break
-      pkt1Len = getInt32(pkt, pos)
-      inc(pos,4)
-      pkt1 = pkt[pos ..< pos + pkt1Len] # pkt[0].unsafeAddr.toOpenArray(pos, pos + pkt1Len - 1)
-      inc(pos,pkt1Len)
+      pkt1Len = int32( uint32(conn.buf[conn.bufPos]) or (uint32(conn.buf[conn.bufPos+1]) shl 8) or (uint32(conn.buf[conn.bufPos+2]) shl 16) )
+      inc(conn.bufPos,4)
+      pkt1 = conn.buf[conn.bufPos ..< conn.bufPos + pkt1Len] # pkt[0].unsafeAddr.toOpenArray(conn.bufPos, conn.bufPos + pkt1Len - 1)
+      inc(conn.bufPos,pkt1Len)
     else:
       await conn.receivePacket()
       # pkt1 = pkt[0].unsafeAddr.toOpenArray(0, pkt.len - 1)
@@ -630,58 +631,55 @@ template processResultset(conn: Connection, pkt:openarray[char], pos:var int, re
       result.status = parseOKPacket(conn)
       break
     elif isERRPacket(conn):
-      raise parseErrorPacket(pkt1)
+      raise parseErrorPacket(conn)
     else:
       process
       if onlyFirst:
         continue
 
-template fetchResultset(conn:Connection, pkt:typed, result:typed, onlyFirst:typed, isTextMode:static[bool], process:untyped): untyped {.dirty.} =
-  var pos = 0
-  let pktLenA = pkt.len
-  processResultset(conn,pkt,pos,result,true,onlyFirst,isTextMode,process)
-  while pos < pktLenA - 1:
-    processResultset(conn,pkt,pos,result,false,onlyFirst,isTextMode,process)
+template fetchResultset(conn:Connection, result:typed, onlyFirst:typed, isTextMode:static[bool], process:untyped): untyped {.dirty.} =
+  processResultset(conn,result,true,onlyFirst,isTextMode,process)
+  while conn.bufPos < conn.payloadLen - 1:
+    processResultset(conn,result,false,onlyFirst,isTextMode,process)
 
 {.push warning[ObservableStores]: off.}
 proc rawExec*(conn: Connection, qs: string): Future[ResultSet[string]] {.
                async,#[ tags: [ReadDbEffect, WriteDbEffect,RootEffect]]#.} =
   await conn.sendQuery(qs)
   await conn.receivePacket()
-  if isOKPacket(pkt):
+  if isOKPacket(conn):
     # Success, but no rows returned.
-    result.status = parseOKPacket(conn, pkt)
-  elif isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
+    result.status = parseOKPacket(conn)
+  elif isERRPacket(conn):
+    raise parseErrorPacket(conn)
   else: 
-    conn.fetchResultset(pkt, result, onlyFirst = false, isTextMode = true): discard
+    conn.fetchResultset(result, onlyFirst = false, isTextMode = true): discard
 
 proc rawQuery*(conn: Connection, qs: string, onlyFirst:bool = false): Future[ResultSet[string]] {.
                async, #[ tags: [ReadDbEffect, WriteDbEffect,RootEffect]]#.} =
   await conn.sendQuery(qs)
   await conn.receivePacket()
-  debug repr pkt
-  if isOKPacket(pkt):
+  if isOKPacket(conn):
     # Success, but no rows returned.
-    result.status = parseOKPacket(conn, pkt)
-  elif isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
-  elif isEOFPacket(pkt):
-    result.status = parseEOFPacket(pkt)
+    result.status = parseOKPacket(conn)
+  elif isERRPacket(conn):
+    raise parseErrorPacket(conn)
+  elif isEOFPacket(conn):
+    result.status = parseEOFPacket(conn)
   else:
-    conn.fetchResultset(pkt, result, onlyFirst, true, result.rows.add(parseTextRow(pkt1)))
+    conn.fetchResultset(result, onlyFirst, true, result.rows.add(parseTextRow(pkt1)))
 
 proc performPreparedQuery*(conn: Connection, pstmt: SqlPrepared, st: Future[void], onlyFirst:static[bool] = false): Future[ResultSet[ResultValue]] {.
                           async#[, tags:[RootEffect]]#.} =
   await st
   await conn.receivePacket()
-  if isOKPacket(pkt):
+  if isOKPacket(conn):
     # Success, but no rows returned.
-    result.status = parseOKPacket(conn, pkt)
-  elif isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
+    result.status = parseOKPacket(conn)
+  elif isERRPacket(conn):
+    raise parseErrorPacket(conn)
   else:
-    conn.fetchResultset(pkt, result, onlyFirst,false, result.rows.add(parseBinaryRow( pkt1 ,result.columns)))
+    conn.fetchResultset(result, onlyFirst,false, result.rows.add(parseBinaryRow( pkt1 ,result.columns)))
 {.pop.}
 
 proc query*(conn: Connection, pstmt: SqlPrepared, params: varargs[SqlParam, asParam]): Future[ResultSet[ResultValue]] {.
@@ -697,14 +695,15 @@ proc selectDatabase*(conn: Connection, database: string): Future[ResponseOK] {.a
   buf.add(database)
   await conn.sendPacket(buf, resetSeqId=true)
   await conn.receivePacket()
-  if isERRPacket(pkt):
-    raise parseErrorPacket(pkt)
-  elif isOKPacket(pkt):
-    return parseOKPacket(conn, pkt)
-  elif isEOFPacket(pkt):
-    return parseEOFPacket(pkt)
+  if isERRPacket(conn):
+    raise parseErrorPacket(conn)
+  elif isOKPacket(conn):
+    return parseOKPacket(conn)
+  elif isEOFPacket(conn):
+    return parseEOFPacket(conn)
   else:
-    raise newException(ProtocolError, "unexpected response to COM_INIT_DB:" & cast[string](pkt))
+    const ErrorMsg = "unexpected response to COM_INIT_DB:$1"
+    raise newException(ProtocolError, ErrorMsg.format cast[string](conn.buf[0].addr))
 
 proc exec*(conn: Connection, qs: SqlQuery, args: varargs[string, `$`]): Future[ResultSet[string]] {.
             asyncVarargs.} =
