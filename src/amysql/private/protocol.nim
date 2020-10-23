@@ -94,7 +94,7 @@ proc parseHandshakePacket*(conn: Connection): HandshakePacket =
     let scrambleBuff2Len = max(13,result.scrambleLen - 8)
     result.scrambleBuff2 = newString(scrambleBuff2Len - 1) # null string
     debug "scrambleBuff2Len" & $scrambleBuff2Len
-    copyMem(result.scrambleBuff2[0].addr,conn.buf[conn.bufPos].addr,scrambleBuff2Len)
+    copyMem(result.scrambleBuff2[0].addr,conn.buf[conn.bufPos].addr,scrambleBuff2Len - 1)
     # result.scrambleBuff2 = cast[string](conn.buf[conn.bufPos ..< (conn.bufPos + 12)])
     inc conn.bufPos,scrambleBuff2Len
     result.scrambleBuff = result.scrambleBuff1 & result.scrambleBuff2
@@ -159,6 +159,7 @@ proc sendPacket*(conn: Connection, buf: sink string, resetSeqId = false): Future
     let success = await withTimeout(send, WriteTimeOut)
     if not success:
       raise newException(TimeoutError, TimeoutErrorMsg)
+    debug "sent:" & repr buf
   else:
     # set global protocol_compression_algorithms='zstd,uncompressed';
     # default value: zlib,zstd,uncompressed
