@@ -63,9 +63,11 @@ proc parseHandshakePacket*(conn: Connection): HandshakePacket =
   conn.threadId = scanU32(conn.buf, conn.bufPos)
   result.threadId = int(conn.threadId)
   inc(conn.bufPos,4)
-  result.scramblebuff1 = cast[string](conn.buf[conn.bufPos .. conn.bufPos+7])
+  result.scramblebuff1 = newString(8)
+  copyMem(result.scramblebuff1[0].addr,conn.buf[conn.bufPos].addr,8)
+  # result.scramblebuff1 = cast[string](conn.buf[conn.bufPos .. conn.bufPos+7])
   inc(conn.bufPos,8)
-  inc conn.bufPos # filter0
+  inc conn.bufPos # filter1
   let capabilities1 = scanU16(conn.buf, conn.bufPos)
   result.capabilities1 = int(capabilities1)
   result.capabilities = result.capabilities1
@@ -87,11 +89,15 @@ proc parseHandshakePacket*(conn: Connection): HandshakePacket =
   result.capabilities = int(cap)
   result.scrambleLen = int(conn.buf[conn.bufPos])
   inc conn.bufPos
-  inc conn.bufPos,10 # filter2
-  result.scrambleBuff2 = cast[string](conn.buf[conn.bufPos ..< (conn.bufPos + 12)])
-  inc conn.bufPos,12
-  result.scrambleBuff = result.scrambleBuff1 & result.scrambleBuff2
-  inc conn.bufPos # filter 3
+  inc conn.bufPos,10 # reserved
+  if Cap.secureConnection in conn.serverCaps:
+    let scrambleBuff2Len = max(13,result.scrambleLen - 8)
+    result.scrambleBuff2 = newString(scrambleBuff2Len - 1) # null string
+    debug "scrambleBuff2Len" & $scrambleBuff2Len
+    copyMem(result.scrambleBuff2[0].addr,conn.buf[conn.bufPos].addr,scrambleBuff2Len)
+    # result.scrambleBuff2 = cast[string](conn.buf[conn.bufPos ..< (conn.bufPos + 12)])
+    inc conn.bufPos,scrambleBuff2Len
+    result.scrambleBuff = result.scrambleBuff1 & result.scrambleBuff2
   if Cap.pluginAuth in conn.serverCaps:
     result.plugin = readNulStringX(conn.buf, conn.bufPos)
 
@@ -148,6 +154,7 @@ proc sendPacket*(conn: Connection, buf: sink string, resetSeqId = false): Future
   when not defined(mysql_compression_mode):
     buf[3] = char( conn.sequenceId )
     inc(conn.sequenceId)
+    debug "send:" & repr buf
     let send = conn.socket.send(buf)
     let success = await withTimeout(send, WriteTimeOut)
     if not success:
@@ -177,7 +184,6 @@ proc sendPacket*(conn: Connection, buf: sink string, resetSeqId = false): Future
         let bufLen = bodyLen + 4
         packetLen = 7 + bufLen
         packet = newSeqOfCap[char](packetLen)
-        packet = newSeqOfCap[char](7 + bufLen)
         packet.setLen(7)
         setInt32(packet,0,bufLen)
         setInt32(packet,4,0)
@@ -382,19 +388,19 @@ proc processHeader(c: Connection, header: openarray[char]): nat24 =
   result = getInt32(@header,0)
   const errMsg = "Bad packet id (got sequence id $1, expected $2)"
   const errMsg2 = "Bad packet id (got compressed sequence id $1, expected $2)"
-  let pnum = uint8(header[3])
+  let id = uint8(header[3])
   when defined(mysql_compression_mode):
     if c.use_zstd():
-      if pnum != c.compressedSequenceId:
-        raise newException(ProtocolError, errMsg2.format(pnum,c.compressedSequenceId ) )
+      if id != c.compressedSequenceId:
+        raise newException(ProtocolError, errMsg2.format(id,c.compressedSequenceId ) )
       c.compressedSequenceId += 1
     else:
-      if pnum != c.sequenceId:
-        raise newException(ProtocolError, errMsg.format(pnum,c.sequenceId) )
+      if id != c.sequenceId:
+        raise newException(ProtocolError, errMsg.format(id,c.sequenceId) )
       c.sequenceId += 1
   else:
-    if pnum != c.sequenceId:
-      raise newException(ProtocolError, errMsg.format(pnum,c.sequenceId) )
+    if id != c.sequenceId:
+      raise newException(ProtocolError, errMsg.format(id,c.sequenceId) )
     c.sequenceId += 1
 
 proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadIOEffect,RootEffect].} =
@@ -440,6 +446,9 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
     if drop_ok:
       return 
     else:
+      debug isAuthSwitchRequestPacket(conn)
+      if isERRPacket(conn):
+        raise parseErrorPacket(conn)
       raise newException(ProtocolError, "Connection closed")
   if headerLen != 4 and headerLen != 7:
     raise newException(ProtocolError, "Connection closed unexpectedly")

@@ -19,7 +19,7 @@ const
   ResponseCode_ExtraAuthData*: uint8 = 1 # 0x01
   NullColumn*       = char(0xFB)
 
-  HandshakeV10 : uint8 = 0x0A  # Initial handshake packet since MySQL 3.21
+  HandshakeV10 : uint8 = 0x0A  # 10 Initial handshake packet since MySQL 3.21
 
   Charset_swedish_ci : uint8 = 0x08
   Charset_utf8_ci*    : uint8 = 0x21
