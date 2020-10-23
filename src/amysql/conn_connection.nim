@@ -220,7 +220,7 @@ proc open*(connection, user, password:string; database = ""): Future[Connection]
   when defined(posix):
     isPath = connection[0] == '/'
   if isPath:
-    sock = newAsyncSocket(AF_UNIX, SOCK_STREAM,buffered=true)
+    sock = newAsyncSocket(AF_UNIX, SOCK_STREAM)
     await connectUnix(sock,connection)
   else:
     let

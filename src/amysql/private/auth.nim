@@ -25,9 +25,6 @@ proc safeSlice(s: string, size: int): string =
   copyMem(result[0].addr, s[0].unsafeAddr, size)
 
 proc scramble_native_password*(scrambleBuff: string, password: string): string =
-  echo "scramble_native_password"
-  echo scrambleBuff.len
-  echo password
   let stage1 = sha1.secureHash(password)
   let stage2 = sha1.secureHash( stage1.toString )
   var ss = newSha1State()

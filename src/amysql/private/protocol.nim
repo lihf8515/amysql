@@ -447,9 +447,6 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
     if drop_ok:
       return 
     else:
-      debug isAuthSwitchRequestPacket(conn)
-      if isERRPacket(conn):
-        raise parseErrorPacket(conn)
       raise newException(ProtocolError, "Connection closed")
   if headerLen != 4 and headerLen != 7:
     raise newException(ProtocolError, "Connection closed unexpectedly")
