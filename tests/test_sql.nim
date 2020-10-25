@@ -88,7 +88,7 @@ proc numberTests(conn: Connection): Future[void] {.async.} =
 
 proc runTests(): Future[void] {.async.} =
   let conn = await open(host_name,user_name,pass_word,database_name)
-  await conn.numberTests()
+  # await conn.numberTests()
   await conn.close()
 
 test "sql":

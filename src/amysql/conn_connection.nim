@@ -60,6 +60,7 @@ proc finishEstablishingConnection(conn: Connection,
   var authResponse = plugin_auth(handshakePacket.plugin, handshakePacket.scrambleBuff, password)
 
   await conn.writeHandshakeResponse(username, authResponse, database, handshakePacket.plugin)
+  debug $conn
   # await confirmation from the server
   await conn.receivePacket()
   debug "HandshakeResponse from server"
@@ -208,7 +209,7 @@ proc open*(uriStr: string | Uri): Future[Connection] {.async.} =
   ## https://dev.mysql.com/doc/refman/8.0/en/connecting-using-uri-or-key-value-pairs.html
   let uri:Uri = when uriStr is string: parseUri(uriStr) else: uriStr
   let port = if uri.port.len > 0: parseInt(uri.port).int32 else: 3306'i32
-  let sock = newAsyncSocket(AF_INET, SOCK_STREAM,buffered=true)
+  let sock = newAsyncSocket(AF_INET, SOCK_STREAM)
   await connect(sock, uri.hostname, Port(port))
   result = await establishConnection(sock, uri.username, uri.password, uri.path[ 1 .. uri.path.high ] )
   if uri.query.len > 0:

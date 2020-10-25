@@ -213,8 +213,8 @@ proc writeHandshakeResponse*(conn: Connection,
   if Cap.longFlag in conn.serverCaps:
     incl(caps, Cap.longFlag)
   if auth_response.len > 0 and Cap.pluginAuthLenencClientData in conn.serverCaps:
-    # if len(auth_response) > 255:
-    incl(caps, Cap.pluginAuthLenencClientData)
+    if len(auth_response) > 255:
+      incl(caps, Cap.pluginAuthLenencClientData)
   if database.len > 0 and Cap.connectWithDb in conn.serverCaps:
     incl(caps, Cap.connectWithDb)
   if auth_plugin.len > 0:
@@ -242,7 +242,7 @@ proc writeHandshakeResponse*(conn: Connection,
     if Cap.pluginAuthLenencClientData in caps:
       putLenInt(buf, len(auth_response))
       buf.add(auth_response)
-    elif Cap.secureConnection in caps:
+    else:# elif Cap.secureConnection in caps:
       putU8(buf, len(auth_response))
       buf.add(auth_response)
   else:
@@ -410,12 +410,11 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   var headerLen:int
   when not defined(mysql_compression_mode):
     offset = NormalLen
-    # let rec = conn.socket.recvInto(conn.buf[0].addr, MysqlBufSize)
-    # let success = await withTimeout(rec, ReadTimeOut)
-    # if not success:
-    #   raise newException(TimeoutError, TimeoutErrorMsg)
-    # headerLen = rec.read
-    headerLen = await conn.socket.recvInto(conn.buf[0].addr, MysqlBufSize)
+    let rec = conn.socket.recvInto(conn.buf[0].addr, MysqlBufSize,flags = {})
+    let success = await withTimeout(rec, ReadTimeOut)
+    if not success:
+      raise newException(TimeoutError, TimeoutErrorMsg)
+    headerLen = rec.read
   else:
     if conn.use_zstd():
       # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression_packet.html#sect_protocol_basic_compression_packet_header
@@ -446,6 +445,7 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   # if headerLen != 4 and headerLen != 7:
   #   raise newException(ProtocolError, "Connection closed unexpectedly")
   conn.payloadLen = conn.processHeader(conn.buf)
+  debug "payloadLen:" & $conn.payloadLen
   inc conn.bufPos,offset
   if conn.payloadLen == 0:
     return 

@@ -32,6 +32,7 @@ proc scramble_native_password*(scrambleBuff: string, password: string): string =
   ss.update(stage2.toString)
   let stage3 = ss.finalize
   result = stage3 xor stage1.Sha1Digest
+  echo "scramble_native_password len" & $result.len
 
 proc scramble_caching_sha2*(scrambleBuff: string, password: string): string =
   let p1 = sha256.digest(password)
