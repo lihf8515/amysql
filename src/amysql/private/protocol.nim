@@ -56,35 +56,30 @@ proc parseHandshakePacket*(conn: Connection): HandshakePacket =
   result.protocolVersion = int(conn.firstByte)
   if result.protocolVersion != HandshakeV10.int:
     raise newException(ProtocolError, "Unexpected protocol version: " & $result.protocolVersion)
-  # var pos = 1
   inc(conn.bufPos)
   conn.serverVersion = readNulString(conn.buf, conn.bufPos)
   result.serverVersion = conn.serverVersion
   conn.threadId = scanU32(conn.buf, conn.bufPos)
-  result.threadId = int(conn.threadId)
   inc(conn.bufPos,4)
+  result.threadId = int(conn.threadId)
   result.scramblebuff1 = newString(8)
   copyMem(result.scramblebuff1[0].addr,conn.buf[conn.bufPos].addr,8)
-  # result.scramblebuff1 = cast[string](conn.buf[conn.bufPos .. conn.bufPos+7])
   inc(conn.bufPos,8)
   inc conn.bufPos # filter1
-  let capabilities1 = scanU16(conn.buf, conn.bufPos)
-  result.capabilities1 = int(capabilities1)
-  result.capabilities = result.capabilities1
-  conn.serverCaps = cast[set[Cap]](capabilities1)
+  result.capabilities1 = int(scanU16(conn.buf, conn.bufPos))
   inc(conn.bufPos,2)
+  result.capabilities = result.capabilities1
+  conn.serverCaps = cast[set[Cap]](result.capabilities1)
   result.charset = int(conn.buf[conn.bufPos])
   inc conn.bufPos
   result.serverStatus = int(scanU16(conn.buf, conn.bufPos))
   inc conn.bufPos,2
-  result.protocol41 = (capabilities1 and Cap.protocol41.ord) > 0
+  result.protocol41 = (result.capabilities1 and Cap.protocol41.ord) > 0
   if not result.protocol41:
     raise newException(ProtocolError, "Old (pre-4.1) server protocol")
-
-  let capabilities2 = scanU16(conn.buf, conn.bufPos)
-  result.capabilities2 = int(capabilities2)
+  result.capabilities2 = int(scanU16(conn.buf, conn.bufPos))
   inc conn.bufPos,2
-  let cap = uint32(capabilities1) + (uint32(capabilities2) shl 16)
+  let cap = uint32(result.capabilities1) + (uint32(result.capabilities2) shl 16)
   conn.serverCaps = cast[set[Cap]]( cap )
   result.capabilities = int(cap)
   result.scrambleLen = int(conn.buf[conn.bufPos])
@@ -93,9 +88,7 @@ proc parseHandshakePacket*(conn: Connection): HandshakePacket =
   if Cap.secureConnection in conn.serverCaps:
     let scrambleBuff2Len = max(13,result.scrambleLen - 8)
     result.scrambleBuff2 = newString(scrambleBuff2Len - 1) # null string
-    debug "scrambleBuff2Len" & $scrambleBuff2Len
     copyMem(result.scrambleBuff2[0].addr,conn.buf[conn.bufPos].addr,scrambleBuff2Len - 1)
-    # result.scrambleBuff2 = cast[string](conn.buf[conn.bufPos ..< (conn.bufPos + 12)])
     inc conn.bufPos,scrambleBuff2Len
     result.scrambleBuff = result.scrambleBuff1 & result.scrambleBuff2
   if Cap.pluginAuth in conn.serverCaps:
@@ -154,7 +147,6 @@ proc sendPacket*(conn: Connection, buf: sink string, resetSeqId = false): Future
   when not defined(mysql_compression_mode):
     buf[3] = char( conn.sequenceId )
     inc(conn.sequenceId)
-    debug "send:" & repr buf
     let send = conn.socket.send(buf)
     let success = await withTimeout(send, WriteTimeOut)
     if not success:
@@ -221,8 +213,8 @@ proc writeHandshakeResponse*(conn: Connection,
   if Cap.longFlag in conn.serverCaps:
     incl(caps, Cap.longFlag)
   if auth_response.len > 0 and Cap.pluginAuthLenencClientData in conn.serverCaps:
-    if len(auth_response) > 255:
-      incl(caps, Cap.pluginAuthLenencClientData)
+    # if len(auth_response) > 255:
+    incl(caps, Cap.pluginAuthLenencClientData)
   if database.len > 0 and Cap.connectWithDb in conn.serverCaps:
     incl(caps, Cap.connectWithDb)
   if auth_plugin.len > 0:
@@ -250,7 +242,7 @@ proc writeHandshakeResponse*(conn: Connection,
     if Cap.pluginAuthLenencClientData in caps:
       putLenInt(buf, len(auth_response))
       buf.add(auth_response)
-    else:
+    elif Cap.secureConnection in caps:
       putU8(buf, len(auth_response))
       buf.add(auth_response)
   else:
@@ -408,6 +400,7 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   # drop_ok used when close
   # https://dev.mysql.com/doc/internals/en/uncompressed-payload.html
   conn.bufPos = 0
+  zeroMem conn.buf.addr,MysqlBufSize
   when TestWhileIdle:
     conn.lastOperationTime = now()
   const TimeoutErrorMsg = "Timeout when receive packet"
@@ -416,11 +409,13 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
   var offset:int
   var headerLen:int
   when not defined(mysql_compression_mode):
-    let rec = conn.socket.recvInto(conn.buf[0].addr, NormalLen)
-    let success = await withTimeout(rec, ReadTimeOut)
-    if not success:
-      raise newException(TimeoutError, TimeoutErrorMsg)
-    headerLen = rec.read
+    offset = NormalLen
+    # let rec = conn.socket.recvInto(conn.buf[0].addr, MysqlBufSize)
+    # let success = await withTimeout(rec, ReadTimeOut)
+    # if not success:
+    #   raise newException(TimeoutError, TimeoutErrorMsg)
+    # headerLen = rec.read
+    headerLen = await conn.socket.recvInto(conn.buf[0].addr, MysqlBufSize)
   else:
     if conn.use_zstd():
       # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression_packet.html#sect_protocol_basic_compression_packet_header
@@ -448,18 +443,19 @@ proc receivePacket*(conn:Connection, drop_ok: bool = false) {.async, tags:[ReadI
       return 
     else:
       raise newException(ProtocolError, "Connection closed")
-  if headerLen != 4 and headerLen != 7:
-    raise newException(ProtocolError, "Connection closed unexpectedly")
+  # if headerLen != 4 and headerLen != 7:
+  #   raise newException(ProtocolError, "Connection closed unexpectedly")
   conn.payloadLen = conn.processHeader(conn.buf)
+  inc conn.bufPos,offset
   if conn.payloadLen == 0:
     return 
-  let payload = conn.socket.recvInto(conn.buf[0].addr,MysqlBufSize)
-  let payloadRecvSuccess = await withTimeout(payload, ReadTimeOut)
-  if not payloadRecvSuccess:
-    raise newException(TimeoutError, TimeoutErrorMsg)
-  conn.bufLen = payload.read
-  if conn.bufLen == 0:
-    raise newException(ProtocolError, "Connection closed unexpectedly")
+  # let payload = conn.socket.recvInto(conn.buf[0].addr,MysqlBufSize)
+  # let payloadRecvSuccess = await withTimeout(payload, ReadTimeOut)
+  # if not payloadRecvSuccess:
+  #   raise newException(TimeoutError, TimeoutErrorMsg)
+  # conn.bufLen = payload.read
+  # if conn.bufLen == 0:
+  #   raise newException(ProtocolError, "Connection closed unexpectedly")
   # if bufLen != payloadLen:
   #   raise newException(ProtocolError, "TODO finish this part")
   when defined(mysql_compression_mode):
